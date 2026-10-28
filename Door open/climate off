@@ -1,0 +1,201 @@
+blueprint:
+  name: Door left open - climate off with restore
+  description: >-
+    When a door is left open, sends a phone alert naming the door at the warning
+    threshold, then turns off the selected climate entities at the shutoff
+    threshold if the door is still open. When the door closes, restores the
+    climate entities to the state they were in before the shutoff.
+  domain: automation
+  source_url: https://gist.github.com/example/door_climate_restore.yaml
+  input:
+    door_sensor:
+      name: Door sensor
+      description: The door/window contact sensor for this room.
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: door
+    door_name:
+      name: Door name
+      description: Friendly name used in the notification, e.g. "Master bedroom".
+      default: Door
+      selector:
+        text:
+    climate_entities:
+      name: Climate entities to turn off
+      description: >-
+        The climate entity for this room (if it has one) plus any shared areas
+        such as the kitchen/living zone. Leave out hub/controller entities.
+      selector:
+        entity:
+          domain: climate
+          multiple: true
+    warn_minutes:
+      name: Warning delay (minutes)
+      description: How long the door may stay open before the warning notification.
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 120
+          unit_of_measurement: minutes
+          mode: box
+    off_minutes:
+      name: Shutoff delay (minutes)
+      description: Total time the door may stay open before climate is turned off.
+      default: 30
+      selector:
+        number:
+          min: 2
+          max: 240
+          unit_of_measurement: minutes
+          mode: box
+    notify_devices:
+      name: Notify devices
+      description: >-
+        One or more notify actions/services, e.g. notify.mobile_app_johns_phone.
+        Enter each as a separate list item.
+      selector:
+        text:
+          multiple: true
+    havc_gate:
+      name: Only run when climate is active
+      description: >-
+        Skip the automation entirely unless at least one climate entity under
+        this label is actively heating/cooling.
+      default: true
+      selector:
+        boolean:
+    hvac_label:
+      name: Climate gate label
+      description: Label used to detect whether any climate control is running.
+      default: climate_controller
+      selector:
+        text:
+
+variables:
+  door_sensor: !input door_sensor
+  door_name: !input door_name
+  climate_entities: !input climate_entities
+  warn_minutes: !input warn_minutes
+  off_minutes: !input off_minutes
+  notify_devices: !input notify_devices
+  havc_gate: !input havc_gate
+  hvac_label: !input hvac_label
+  # Minutes to wait after the warning before shutting off
+  remaining_minutes: "{{ [off_minutes | int - warn_minutes | int, 1] | max }}"
+
+trigger:
+  - trigger: state
+    entity_id: !input door_sensor
+    from: "off"
+    to: "on"
+    for:
+      minutes: !input warn_minutes
+
+condition:
+  # Optional gate: only act if some climate control is currently active
+  - condition: template
+    value_template: >-
+      {% if not havc_gate %}
+        true
+      {% else %}
+        {% set ents = label_entities(hvac_label) | select('match', '^climate\\.') | list %}
+        {% set active = ents | select('is_state', ['heat','cool','heat_cool','dry','fan_only']) | list %}
+        {{ active | count > 0 }}
+      {% endif %}
+
+action:
+  # Capture the current state of each target entity so we can restore later
+  - variables:
+      snapshot: >-
+        {% set ns = namespace(items=[]) %}
+        {% for e in climate_entities %}
+          {% set ns.items = ns.items + [{'entity': e, 'state': states(e)}] %}
+        {% endfor %}
+        {{ ns.items }}
+
+  # --- WARNING NOTIFICATION ---
+  - repeat:
+      for_each: "{{ notify_devices }}"
+      sequence:
+        - action: "{{ repeat.item }}"
+          data:
+            title: "Door left open: {{ door_name }}"
+            message: >-
+              {{ door_name }} door has been open for {{ warn_minutes }} minutes.
+              Climate will turn off in {{ remaining_minutes }} minutes if it
+              stays open.
+
+  # --- WAIT FOR DOOR TO CLOSE, UP TO THE SHUTOFF THRESHOLD ---
+  - wait_for_trigger:
+      - trigger: state
+        entity_id: !input door_sensor
+        from: "on"
+        to: "off"
+    timeout:
+      minutes: "{{ remaining_minutes }}"
+    continue_on_timeout: true
+
+  # --- BRANCH: STILL OPEN -> SHUT OFF ; CLOSED -> RESTORE ---
+  - choose:
+      # Door still open: turn off climate and alert
+      - conditions:
+          - condition: template
+            value_template: "{{ is_state(door_sensor, 'on') }}"
+        sequence:
+          - action: climate.turn_off
+            target:
+              entity_id: "{{ climate_entities }}"
+            data: {}
+          - repeat:
+              for_each: "{{ notify_devices }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Climate turned off: {{ door_name }}"
+                    message: >-
+                      {{ door_name }} door was left open for {{ off_minutes }}
+                      minutes. Climate has been turned off for:
+                      {{ climate_entities | join(', ') }}.
+
+      # Door closed before shutoff: restore the captured states
+      - conditions:
+          - condition: template
+            value_template: "{{ is_state(door_sensor, 'off') }}"
+        sequence:
+          - repeat:
+              for_each: "{{ snapshot }}"
+              sequence:
+                - choose:
+                    # Restore to an active HVAC mode
+                    - conditions:
+                        - condition: template
+                          value_template: >-
+                            {{ repeat.item.state in
+                               ['heat','cool','heat_cool','dry','fan_only','auto'] }}
+                      sequence:
+                        - action: climate.set_hvac_mode
+                          target:
+                            entity_id: "{{ repeat.item.entity }}"
+                          data:
+                            hvac_mode: "{{ repeat.item.state }}"
+                  default:
+                    # Was off before, leave it off
+                    - action: climate.turn_off
+                      target:
+                        entity_id: "{{ repeat.item.entity }}"
+                      data: {}
+          - repeat:
+              for_each: "{{ notify_devices }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Door closed: {{ door_name }}"
+                    message: >-
+                      {{ door_name }} door was closed. Climate restored for:
+                      {{ climate_entities | join(', ') }}.
+    default: []
+
+mode: single
+max_exceeded: silent
