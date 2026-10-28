@@ -59,7 +59,7 @@ blueprint:
         boolean:
 
 variables:
-  door_sensor: !input door_sensor
+  door_sensor: !input - binary_sensor.door_sensor
   door_name: !input door_name
   climate_entities: !input climate_entities
   warn_delay: !input warn_delay
