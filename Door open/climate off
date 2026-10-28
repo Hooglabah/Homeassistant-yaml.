@@ -2,26 +2,29 @@ blueprint:
   name: Door Left Open - Climate Off & Restore
   description: >-
     Sends phone alerts when a door is left open, turns off specific climate zones
-    after a delay, and restores them when the door closes.
+    after a delay, and restores them when the door closes. Designed for parallel
+    tracking of multiple doors.
   domain: automation
   author: User
   input:
     door_sensor:
       name: Door Sensor
-      description: The binary sensor for the door.
+      description: The binary sensor for the door (e.g., binary_sensor.door_1).
       selector:
         entity:
           domain: binary_sensor
           device_class: door
     door_name:
       name: Friendly Door Name
-      description: Name used in notifications.
+      description: Name used in notifications (e.g., "Master Bedroom").
       default: Unknown Door
       selector:
         text:
     climate_entities:
       name: Climate Entities to Control
-      description: List of climate entities to turn off.
+      description: >-
+        List of climate entities to turn off (e.g., climate.mainbedroom).
+        Include shared zones like kitchen/living if applicable.
       selector:
         entity:
           domain: climate
@@ -38,7 +41,7 @@ blueprint:
           mode: box
     off_delay:
       name: Shutoff Delay (Minutes)
-      description: Total time before turning off climate.
+      description: Total time before turning off climate (must be > Warning Delay).
       default: 30
       selector:
         number:
@@ -48,18 +51,22 @@ blueprint:
           mode: box
     notify_service:
       name: Notification Service
-      description: The notify service to use (e.g., notify.mobile_app_your_phone).
+      description: >-
+        The notify service to use (e.g., notify.mobile_app_your_phone).
+        Enter the full service name.
       selector:
         text:
     enable_hvac_gate:
       name: Only Run If HVAC Is Active
-      description: If checked, only runs if climate is active.
+      description: >-
+        If checked, the automation only runs if at least one climate entity
+        is currently in heat/cool mode.
       default: true
       selector:
         boolean:
 
 variables:
-  door_sensor: !input - binary_sensor.door_sensor
+  door_sensor: !input door_sensor
   door_name: !input door_name
   climate_entities: !input climate_entities
   warn_delay: !input warn_delay
@@ -67,13 +74,6 @@ variables:
   notify_service: !input notify_service
   enable_hvac_gate: !input enable_hvac_gate
   wait_time: "{{ [off_delay | int - warn_delay | int, 1] | max }}"
-  # Capture initial states as a list of strings "entity|state"
-  initial_states: >-
-    {% set ns = namespace(res=[]) %}
-    {% for e in climate_entities %}
-      {% set ns.res = ns.res + [e ~ '|' ~ states(e)] %}
-    {% endfor %}
-    {{ ns.res | join(',') }}
 
 trigger:
   - platform: state
@@ -99,6 +99,15 @@ condition:
       {% endif %}
 
 action:
+  # Snapshot current states for restoration
+  - variables:
+      snapshot: >-
+        {% set ns = namespace(data=[]) %}
+        {% for ent in climate_entities %}
+          {% set ns.data = ns.data + [{'entity_id': ent, 'state': states(ent)}] %}
+        {% endfor %}
+        {{ ns.data }}
+
   # --- STEP 1: WARNING NOTIFICATION ---
   - service: "{{ notify_service }}"
     data:
@@ -107,7 +116,7 @@ action:
         The {{ door_name }} door has been open for {{ warn_delay }} minutes.
         Climate will turn off in {{ wait_time }} minutes if it remains open.
 
-  # --- STEP 2: WAIT ---
+  # --- STEP 2: WAIT FOR DOOR TO CLOSE OR TIMEOUT ---
   - wait_for_trigger:
       - platform: state
         entity_id: !input door_sensor
@@ -117,9 +126,9 @@ action:
       minutes: "{{ wait_time }}"
     continue_on_timeout: true
 
-  # --- STEP 3: CHOOSE ---
+  # --- STEP 3: DECIDE ACTION ---
   - choose:
-      # Case A: Still Open -> Turn Off
+      # Case A: Door still open -> Turn Off
       - conditions:
           - condition: template
             value_template: "{{ is_state(door_sensor, 'on') }}"
@@ -132,42 +141,41 @@ action:
               title: "Climate Turned Off: {{ door_name }}"
               message: >-
                 The {{ door_name }} door was open for {{ off_delay }} minutes.
-                Climate turned off.
+                Climate has been turned off for: {{ climate_entities | join(', ') }}.
 
-      # Case B: Closed -> Restore
+      # Case B: Door closed -> Restore
       - conditions:
           - condition: template
             value_template: "{{ is_state(door_sensor, 'off') }}"
         sequence:
           - repeat:
-              for_each: "{{ initial_states.split(',') }}"
+              for_each: "{{ snapshot }}"
               sequence:
-                - variables:
-                    parts: "{{ repeat.item.split('|') }}"
-                    entity: "{{ parts[0] }}"
-                    old_state: "{{ parts[1] }}"
                 - choose:
+                    # Restore to HVAC mode if it was active
                     - conditions:
                         - condition: template
-                          value_template: "{{ old_state in ['heat', 'cool', 'heat_cool', 'dry', 'fan_only', 'auto'] }}"
+                          value_template: >-
+                            {{ repeat.item.state in ['heat', 'cool', 'heat_cool', 'dry', 'fan_only', 'auto'] }}
                       sequence:
                         - service: climate.set_hvac_mode
                           target:
-                            entity_id: "{{ entity }}"
+                            entity_id: "{{ repeat.item.entity_id }}"
                           data:
-                            hvac_mode: "{{ old_state }}"
-                    - conditions:
-                        - condition: template
-                          value_template: "{{ true }}"
-                      sequence:
-                        - service: climate.turn_off
-                          target:
-                            entity_id: "{{ entity }}"
+                            hvac_mode: "{{ repeat.item.state }}"
+                    # Otherwise, ensure it stays off
+                    - condition: template
+                      value_template: "{{ true }}"
+                    sequence:
+                      - service: climate.turn_off
+                        target:
+                          entity_id: "{{ repeat.item.entity_id }}"
           - service: "{{ notify_service }}"
             data:
               title: "Door Closed: {{ door_name }}"
               message: >-
-                The {{ door_name }} door was closed. Climate restored.
+                The {{ door_name }} door was closed. Climate restored for:
+                {{ climate_entities | join(', ') }}.
 
 mode: single
 max_exceeded: silent
